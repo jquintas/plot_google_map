@@ -11,13 +11,17 @@ function varargout = plot_google_map(varargin)
 % Returns the map without plotting it
 %
 % PROPERTIES:
-%    Axis           - Axis handle. If not given, gca is used. (LP)
+%    Axis           - Axis handle. If not given, gca is used.
 %    Height (640)   - Height of the image in pixels (max 640)
 %    Width  (640)   - Width of the image in pixels (max 640)
 %    Scale (2)      - (1/2) Resolution scale factor. Using Scale=2 will
 %                     double the resulotion of the downloaded image (up
 %                     to 1280x1280) and will result in finer rendering,
 %                     but processing time will be longer.
+%    Resize (1)     - (recommended 1-2) Resolution upsampling factor. 
+%                     Increases image resolution using imresize(). This results
+%                     in a finer image but it needs the image processing
+%                     toolbox and processing time will be longer.
 %    MapType        - ('roadmap') Type of map to return. Any of [roadmap, 
 %                     satellite, terrain, hybrid]. See the Google Maps API for
 %                     more information. 
@@ -28,6 +32,9 @@ function varargout = plot_google_map(varargin)
 %                     readability if many colors are plotted 
 %                     (using SCATTER for example).
 %    ShowLabels (1) - (0/1) Controls whether to display city/street textual labels on the map
+%    Style          - (string) A style configuration string. See:
+%                     https://developers.google.com/maps/documentation/static-maps/?csw=1#StyledMaps
+%                     http://instrument.github.io/styled-maps-wizard/
 %    Language       - (string) A 2 letter ISO 639-1 language code for displaying labels in a 
 %                     local language instead of English (where available).
 %                     For example, for Chinese use:
@@ -86,9 +93,16 @@ function varargout = plot_google_map(varargin)
 % Author:
 %  Zohar Bar-Yehuda
 %
+% Version 1.8 - 25/04/2016 - By Hannes Diethelm
+%       - Add resize parameter to resize image using imresize()
+%       - Fix scale parameter
+% Version 1.7 - 14/04/2016
+%       - Add custom style support
+% Version 1.6 - 12/11/2015
+%       - Use system temp folder for writing image files (with fallback to current dir if missing write permissions)
 % Version 1.5 - 20/11/2014
 %       - Support for MATLAB R2014b
-%       - several fixes complex layouts: several maps in one figure, 
+%       - several fixes for complex layouts: several maps in one figure, 
 %         map inside a panel, specifying axis handle as input (thanks to Luke Plausin)
 % Version 1.4 - 25/03/2014
 %       - Added the language parameter for showing labels in a local language
@@ -103,7 +117,7 @@ function varargout = plot_google_map(varargin)
 %       - Set and use an API key which enables a much higher usage volume per day.
 % Version 1.1 - 25/08/2011
 
-persistent apiKey
+persistent apiKey useTemp
 if isnumeric(apiKey)
     % first run, check if API key file exists
     if exist('api_key.mat','file')
@@ -112,6 +126,26 @@ if isnumeric(apiKey)
         apiKey = '';
     end
 end
+
+if isempty(useTemp)
+    % first run, check we we have wrtie access to the temp folder
+    try 
+        tempfilename = tempname;
+        fid = fopen(tempfilename, 'w');
+        if fid > 0
+            fclose(fid);
+            useTemp = true;
+            delete(tempfilename);
+        else
+            % Don't have write access to temp folder or it doesn't exist, fallback to current dir
+            useTemp = false;
+        end
+    catch
+        % in case tempname fails for some reason
+        useTemp = false;
+    end
+end
+
 hold on
 
 % Default parametrs
@@ -119,6 +153,7 @@ axHandle = gca;
 height = 640;
 width = 640;
 scale = 2;
+resize = 1;
 maptype = 'roadmap';
 alphaData = 1;
 autoRefresh = 1;
@@ -128,6 +163,7 @@ showLabels = 1;
 language = '';
 markeridx = 1;
 markerlist = {};
+style = '';
 
 % Handle input arguments
 if nargin >= 2
@@ -139,6 +175,13 @@ if nargin >= 2
                 height = varargin{idx+1};
             case 'width'
                 width = varargin{idx+1};
+            case 'scale'
+                scale = round(varargin{idx+1});
+                if scale < 1 || scale > 2
+                    error('Scale must be 1 or 2');
+                end
+            case 'resize'
+                resize = varargin{idx+1};
             case 'maptype'
                 maptype = varargin{idx+1};
             case 'alpha'
@@ -163,6 +206,8 @@ if nargin >= 2
                 pth = fileparts(funcFile);
                 keyFile = fullfile(pth,'api_key.mat');
                 save(keyFile,'apiKey')
+            case 'style'
+                style = varargin{idx+1};
             otherwise
                 error(['Unrecognized variable: ' varargin{idx}])
         end
@@ -177,10 +222,18 @@ end
 
 % Store paramters in axis handle (for auto refresh callbacks)
 ud = get(axHandle, 'UserData');
+if isempty(ud)
+    % explicitly set as struct to avoid warnings
+    ud = struct;
+end
 ud.gmap_params = varargin;
 set(axHandle, 'UserData', ud);
 
 curAxis = axis(axHandle);
+if max(abs(curAxis)) > 500    
+    return;
+end    
+
 % Enforce Latitude constraints of EPSG:900913 
 if curAxis(3) < -85
     curAxis(3) = -85;
@@ -322,11 +375,14 @@ for idx = 1:length(markerlist)
         markers = [markers markerlist{idx}];
     end
 end
+
 if showLabels == 0
-    labelsStr = '&style=feature:all|element:labels|visibility:off';
-else
-    labelsStr = '';
+    if ~isempty(style)
+        style(end+1) = '|';
+    end
+    style = [style 'feature:all|element:labels|visibility:off'];
 end
+
 if ~isempty(language)
     languageStr = ['&language=' language];
 else
@@ -343,38 +399,40 @@ else
     convertNeeded = 1;
 end
 sensor = '&sensor=false';
-url = [preamble location zoomStr sizeStr maptypeStr format markers labelsStr languageStr sensor keyStr];
+
+if ~isempty(style)
+    styleStr = ['&style=' style];
+else
+    styleStr = '';
+end
+
+url = [preamble location zoomStr sizeStr maptypeStr format markers languageStr sensor keyStr styleStr];
 
 % Get the image
+if useTemp
+    filepath = fullfile(tempdir, filename);
+else
+    filepath = filename;
+end
+
 try
-    urlwrite(url,filename);
+    urlwrite(url,filepath);
 catch % error downloading map
-    warning(sprintf(['Unable to download map form Google Servers.\n' ...
-        'Possible reasons: no network connection, quota exceeded, or some other error.\n' ...
+    warning(['Unable to download map form Google Servers.\n' ...
+        'Matlab error was: %s\n\n' ...
+        'Possible reasons: missing write permissions, no network connection, quota exceeded, or some other error.\n' ...
         'Consider using an API key if quota problems persist.\n\n' ...
-        'To debug, try pasting the following URL in your browser, which may result in a more informative error:\n%s'], url));
+        'To debug, try pasting the following URL in your browser, which may result in a more informative error:\n%s'], lasterr, url);
     varargout{1} = [];
     varargout{2} = [];
     varargout{3} = [];
     return
 end
-[M Mcolor] = imread(filename);
+[M Mcolor] = imread(filepath);
 M = cast(M,'double');
-delete(filename); % delete temp file
+delete(filepath); % delete temp file
 width = size(M,2);
 height = size(M,1);
-
-% Calculate a meshgrid of pixel coordinates in EPSG:900913
-centerPixelY = round(height/2);
-centerPixelX = round(width/2);
-[centerX,centerY] = latLonToMeters(lat, lon ); % center coordinates in EPSG:900913
-curResolution = initialResolution / 2^zoomlevel/scale; % meters/pixel (EPSG:900913)
-xVec = centerX + ((1:width)-centerPixelX) * curResolution; % x vector
-yVec = centerY + ((height:-1:1)-centerPixelY) * curResolution; % y vector
-[xMesh,yMesh] = meshgrid(xVec,yVec); % construct meshgrid 
-
-% convert meshgrid to WGS1984
-[lonMesh,latMesh] = metersToLatLon(xMesh,yMesh);
 
 % We now want to convert the image from a colormap image with an uneven
 % mesh grid, into an RGB truecolor image with a uniform grid.
@@ -392,11 +450,28 @@ if convertNeeded
 else
     imag = M/255;
 end
+% Resize if needed
+if resize ~= 1
+    imag = imresize(imag, resize, 'bilinear');
+end
+
+% Calculate a meshgrid of pixel coordinates in EPSG:900913
+width = size(imag,2);
+height = size(imag,1);
+centerPixelY = round(height/2);
+centerPixelX = round(width/2);
+[centerX,centerY] = latLonToMeters(lat, lon ); % center coordinates in EPSG:900913
+curResolution = initialResolution / 2^zoomlevel / scale / resize; % meters/pixel (EPSG:900913)
+xVec = centerX + ((1:width)-centerPixelX) * curResolution; % x vector
+yVec = centerY + ((height:-1:1)-centerPixelY) * curResolution; % y vector
+[xMesh,yMesh] = meshgrid(xVec,yVec); % construct meshgrid 
+
+% convert meshgrid to WGS1984
+[lonMesh,latMesh] = metersToLatLon(xMesh,yMesh);
 
 % Next, project the data into a uniform WGS1984 grid
-sizeFactor = 1; % factoring of new image
-uniHeight = round(height*sizeFactor);
-uniWidth = round(width*sizeFactor);
+uniHeight = round(height*resize);
+uniWidth = round(width*resize);
 latVect = linspace(latMesh(1,1),latMesh(end,1),uniHeight);
 lonVect = linspace(lonMesh(1,1),lonMesh(1,end),uniWidth);
 [uniLonMesh,uniLatMesh] = meshgrid(lonVect,latVect);
@@ -412,7 +487,9 @@ uniImag =  myTurboInterp2(lonMesh,latMesh,imag,uniLonMesh,uniLatMesh);
 if nargout <= 1 % plot map
     % display image
     hold(axHandle, 'on');
+    cax = caxis;
     h = image(lonVect,latVect,uniImag, 'Parent', axHandle);
+    caxis(cax); % Preserve caxis that is sometimes changed by the call to image()
     set(axHandle,'YDir','Normal')
     set(h,'tag','gmap')
     set(h,'AlphaData',alphaData)
@@ -568,5 +645,3 @@ for idx = 1:length(axes_objs)
         plot_google_map(params{:});
     end
 end
-
-    
